@@ -1,0 +1,29 @@
+# STM32CubeIDE project ignores
+.settings/
+.project
+.cproject
+.mxproject
+
+# Build output
+Debug/
+Release/
+*.elf
+*.map
+*.list
+
+# Auto-generated makefiles and objects
+*.o
+*.d
+*.su
+*.cyclo
+*.mk
+
+# Backup / temp
+*~
+*.swp
+
+# Eclipse/IDE misc
+*.launch
+
+# LwIP generated stuff
+Middlewares/Third_Party/LwIP/*/subdir.mk
