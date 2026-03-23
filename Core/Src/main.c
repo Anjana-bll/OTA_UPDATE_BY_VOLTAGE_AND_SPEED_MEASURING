@@ -23,7 +23,11 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+
 #include "feature_engine.h"
+#include "nvm_lite.h"
+#include "motor_driver.h"
+#include "window_controller.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,34 +53,6 @@ ADC_HandleTypeDef hadc3;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-
-/* === Motor Hardware Pins (H-Bridge) === */
-#define H_IN1_GPIO_Port   GPIOF
-#define H_IN1_Pin         GPIO_PIN_2   // pin1 -> PF2
-#define H_IN2_GPIO_Port   GPIOF
-#define H_IN2_Pin         GPIO_PIN_9   // pin2 -> PF9
-#define H_IN3_GPIO_Port   GPIOE
-#define H_IN3_Pin         GPIO_PIN_13  // pin3 -> PE13
-#define H_IN4_GPIO_Port   GPIOE
-#define H_IN4_Pin         GPIO_PIN_14  // pin4 -> PE14
-
-#define DEAD_TIME_MS      5U  // safe dead-time between direction changes
-
-/* === Window state machine === */
-typedef enum {
-    STATE_STOP = 0,
-    STATE_UP,
-    STATE_DOWN,
-    STATE_PINCH
-} WindowState;
-
-volatile WindowState state = STATE_STOP;
-/* Remember last motor-applied state to avoid repeatedly driving pins */
-static WindowState last_motor_applied = (WindowState)(-1);
-
-/* 100ms timers */
-volatile uint8_t motionTimer = 0;     // UP/DOWN duration (ticks of 100ms)
-volatile uint8_t pinchAlertTimer = 0; // PINCH alert duration (ticks of 100ms)
 static uint32_t last_tick_ms = 0;
 
 /* Safer UART receive buffers */
@@ -98,149 +74,54 @@ static void MX_ADC3_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
-/* === Motor API prototypes === */
-static void set_forward(void);
-static void set_reverse(void);
-static void set_stop(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* Option 2: feature handler to enable anti-pinch flag */
+/* === Feature enable handler ===*/
 static feat_status_t on_antipinch_enable(const char *nonce, const char *rawName)
 {
     (void)nonce; (void)rawName;
+
+    /* 1) Mark runtime state */
+    feature_mark_enabled_once_ci("ANTIPINCH");
+
+    /* 2) Read latest record (ok if none) */
+    nvm_record_t rec = {0};
+    (void)nvm_read_latest(&rec);
+    rec.feature_flags |= FEAT_ANTIPINCH_EN;
+
+    /* 3) Persist to Flash */
+    if (nvm_write(&rec) != HAL_OK) {
+        const char *e = "NVM write failed\r\n";
+        HAL_UART_Transmit(&huart3, (uint8_t*)e, strlen(e), 50);
+        return FEAT_ERR;
+    }
+
+    const char *ok = "ANTIPINCH enabled (persisted)\r\n";
+    HAL_UART_Transmit(&huart3, (uint8_t*)ok, strlen(ok), 50);
+
     return FEAT_OK;
 }
-/* Simple LED patterns using BSP LEDs (no PWM):
-   - UP    : GREEN ON steady
-   - DOWN  : YELLOW blink
-   - PINCH : RED fast flash (then auto DOWN)
-   - STOP  : all OFF
-*/
-static void updateLED_100ms_simple(void)
+
+static void restore_features_from_flash(void)
 {
-    static uint8_t toggle = 0;
-    toggle ^= 1;
-
-    switch (state)
-    {
-        case STATE_STOP:
-            BSP_LED_Off(LED_GREEN);
-            BSP_LED_Off(LED_YELLOW);
-            BSP_LED_Off(LED_RED);
-            break;
-
-        case STATE_UP:
-            BSP_LED_On(LED_GREEN);
-            BSP_LED_Off(LED_YELLOW);
-            BSP_LED_Off(LED_RED);
-            if (motionTimer > 0) motionTimer--; else state = STATE_STOP;
-            break;
-
-        case STATE_DOWN:
-            BSP_LED_Off(LED_GREEN);
-            if (toggle) BSP_LED_On(LED_YELLOW); else BSP_LED_Off(LED_YELLOW);
-            BSP_LED_Off(LED_RED);
-            if (motionTimer > 0) motionTimer--; else state = STATE_STOP;
-            break;
-
-        case STATE_PINCH:
-            // fast flash RED for 2s, then auto DOWN 3s
-            BSP_LED_Off(LED_GREEN);
-            BSP_LED_Off(LED_YELLOW);
-            if (toggle) BSP_LED_On(LED_RED); else BSP_LED_Off(LED_RED);
-
-            if (pinchAlertTimer > 0) {
-                pinchAlertTimer--;
-            } else {
-                state = STATE_DOWN;
-                motionTimer = 30; // 3 seconds (30 * 100ms)
-            }
-            break;
+    if (nvm_init() != HAL_OK) {
+        const char *e = "NVM init failed\r\n";
+        HAL_UART_Transmit(&huart3, (uint8_t*)e, strlen(e), 50);
+        return;
     }
-}
 
-/* Call this when your pinch sensor triggers (or for testing) */
-static void onPinchDetected(void)
-{
-	if (feature_is_enabled_ci("ANTIPINCH") && state == STATE_UP)
-	{
-	    /* same as before */
-	    state = STATE_PINCH;
-	    pinchAlertTimer = 20;
-	    motionTimer = 0; //stop-UP
-	    last_motor_applied = (WindowState)(-1); //force immediate motor sync on next iteration
-
-	    const char msg[] = "Anti-pinch: reversing window\r\n";
-	    HAL_UART_Transmit(&huart3, (uint8_t*)msg, sizeof(msg)-1, 50);
-	}else {
-        const char msg[] = "PINCH ignored (disabled or not UP)\r\n";
-        HAL_UART_Transmit(&huart3, (uint8_t*)msg, sizeof(msg)-1, 50);
+    nvm_record_t rec = {0};
+    if (nvm_read_latest(&rec) && (rec.feature_flags & FEAT_ANTIPINCH_EN)) {
+        feature_mark_enabled_once_ci("ANTIPINCH");
+        const char *m = "ANTIPINCH restored from Flash\r\n";
+        HAL_UART_Transmit(&huart3, (uint8_t*)m, strlen(m), 50);
+    } else {
+        const char *m = "ANTIPINCH not set in Flash\r\n";
+        HAL_UART_Transmit(&huart3, (uint8_t*)m, strlen(m), 50);
     }
-}
-
-/* Low-level write helper */
-static void motor_sync_with_state(void)
-{
-    if (last_motor_applied == state) return;
-    last_motor_applied = state;
-
-    switch (state)
-    {
-        case STATE_STOP:
-            set_stop();
-            break;
-        case STATE_UP:
-            set_forward();
-            break;
-        case STATE_DOWN:
-            set_reverse();
-            break;
-        case STATE_PINCH:
-            set_stop();  // stop immediately during PINCH alert
-            break;
-    }
-}
-
-static inline void pins_write(uint8_t in1, uint8_t in2, uint8_t in3, uint8_t in4)
-{
-  HAL_GPIO_WritePin(H_IN1_GPIO_Port, H_IN1_Pin, in1 ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(H_IN2_GPIO_Port, H_IN2_Pin, in2 ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(H_IN3_GPIO_Port, H_IN3_Pin, in3 ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(H_IN4_GPIO_Port, H_IN4_Pin, in4 ? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
-
-static void all_pins_low(void) { pins_write(0,0,0,0); }
-
-static void set_forward(void)
-{
-	const char msg[] = "Motor Forward\r\n";
-
-  all_pins_low();
-  HAL_Delay(DEAD_TIME_MS);
-  /* Keep your original pattern exactly (as in your motor code) */
-  // PF2 + PE13 HIGH
-  pins_write(1,0,1,0);
-  HAL_UART_Transmit(&huart3,(uint8_t*)msg,sizeof(msg)-1,50);
-}
-
-static void set_reverse(void)
-{
-  all_pins_low();
-  HAL_Delay(DEAD_TIME_MS);
-  /* Keep your original pattern exactly */
-  // PF9 + PE14 HIGH
-  pins_write(0,1,0,1);
-  const char msg[] = "Motor Reverse\r\n";
-  HAL_UART_Transmit(&huart3,(uint8_t*)msg,sizeof(msg)-1,50);
-
-}
-
-static void set_stop(void)
-{
-  /* All low => electrical brake */
-  all_pins_low();
 }
 
 /* USER CODE END 0 */
@@ -283,8 +164,10 @@ int main(void)
   feature_register("ANTIPINCH", on_antipinch_enable);
   /* Accept aliases */
   feature_add_alias("ANTIPINCH", "ANTI-PINCH_WINDOWS");
+
   /* You can register others and   */
   #endif
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -293,6 +176,12 @@ int main(void)
   MX_USART3_UART_Init();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
+  /* === Modules Init === */
+  motor_init();
+  window_init();
+  /* Restore persisted features */
+  restore_features_from_flash();
+
   HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1);
   /* USER CODE END 2 */
 
@@ -308,13 +197,13 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  // 100 ms soft tick
 	  uint32_t now = HAL_GetTick();
 	  if ((now - last_tick_ms) >= 100) {
 	      last_tick_ms = now;
-	      updateLED_100ms_simple();
-	      motor_sync_with_state();
+	      window_100ms_task();
 	  }
+	  /* Motor sync task */
+	  window_motor_task();
 
 	  if (frame_ready)
 	  {
@@ -332,7 +221,8 @@ int main(void)
 	      {
 	    	feature_engine_handle_activation(featureId, nonce, ack, sizeof(ack));
 	    	BSP_LED_On(LED_RED); /* indicate an ACK was produced */
-	      } else {
+	      }
+          else {
 	    	snprintf(ack, sizeof(ack), "<ACK,?,? ,ERROR_FORMAT>");
 	      }
 
@@ -709,26 +599,7 @@ void BSP_PB_Callback(Button_TypeDef Button)
 {
     if (Button == BUTTON_USER)
     {
-        static uint32_t last = 0;
-        uint32_t now = HAL_GetTick();
-        if ((now - last) < 80) return;
-        last = now;
-
-        /* FIRST PRESS -> WINDOW UP */
-        if (state == STATE_STOP)
-        {
-            state = STATE_UP;
-            motionTimer = 100;   // run longer
-        }
-
-        /* SECOND PRESS -> PINCH EVENT */
-        else if (state == STATE_UP)
-        {
-            if (feature_is_enabled_ci("ANTIPINCH"))
-            {
-                onPinchDetected();   // triggers anti-pinch logic
-            }
-        }
+    	window_user_button_pressed();
     }
 }
 /* USER CODE END 4 */

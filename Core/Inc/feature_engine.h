@@ -72,6 +72,18 @@ feat_status_t feature_engine_handle_activation(const char *rawFeature,
  */
 int feature_is_enabled_ci(const char *rawName);
 
+/**
+ * @brief Mark a feature as disabled in TABLE mode (sets enabled_once=1).
+ *        No-op / error for STORE mode.
+ */
+feat_status_t feature_mark_enabled_once_ci(const char *rawName);
+
+/**
+ * @brief Mark a feature as disabled in TABLE mode (sets enabled_once=0).
+ *        No-op / error for STORE mode.
+ */
+feat_status_t feature_mark_disabled_once_ci(const char *rawName);
+
 /* ====== Option 2: TABLE mode registration API ====== */
 #if FE_USE_TABLE
 /**

@@ -7,7 +7,7 @@
 
 #include "feature_engine.h"
 #include <string.h>
- #include <stdio.h>
+#include <stdio.h>
 
 /* ===========================
    Local config
@@ -112,6 +112,29 @@ feat_status_t feature_register(const char *name, feat_handler_t handler)
         }
     }
     return FEAT_ERR_FULL;
+}
+
+feat_status_t feature_mark_enabled_once_ci(const char *rawName)
+{
+#if FE_USE_TABLE
+	if (!rawName) return FEAT_ERR_BADARG;
+    int idx = find_entry_index(rawName);
+    if (idx < 0) return FEAT_ERR_NOT_FOUND;
+    g_table[idx].enabled_once = 1;
+    return FEAT_OK;
+#else
+    (void)rawName;
+    return FEAT_ERR_BADARG;
+#endif
+}
+
+feat_status_t feature_mark_disabled_once_ci(const char *rawName)
+{
+    if (!rawName) return FEAT_ERR_BADARG;
+    int idx = find_entry_index(rawName);
+    if (idx < 0) return FEAT_ERR_NOT_FOUND;
+    g_table[idx].enabled_once = 0;
+    return FEAT_OK;
 }
 
 feat_status_t feature_add_alias(const char *canonical, const char *alias)
@@ -232,3 +255,4 @@ int feature_is_enabled_ci(const char *rawName)
     return (find_store_index(norm) >= 0);
 #endif
 }
+
